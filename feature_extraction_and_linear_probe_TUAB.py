@@ -548,35 +548,36 @@ def extract_and_merge_split(split_name, dataset, model, temp_dir, device, batch_
     num_batches = len(loader)
     layer_paths = {}
 
+    # 배치 파일 하나에 모든 layer가 함께 저장되어 있으므로, layer마다 배치 파일을
+    # 반복해서 다시 읽지 않도록 배치를 한 번만 순회하면서 모든 layer 텐서를 동시에 채운다.
+    # (layer별로 두 번씩 읽던 기존 방식은 디스크 I/O가 8배 이상 불필요하게 발생했다)
+    print(f"[{split_name}] Pre-allocating tensors for {len(TARGET_LAYERS)} layers...")
+    first_batch = torch.load(os.path.join(batch_temp_dir, "batch_0.pt"), map_location='cpu', weights_only=False)
+    layer_tensors = {}
     for layer_num in TARGET_LAYERS:
         layer_idx = layer_num - 1
-        print(f"[{split_name}] Processing and merging Layer {layer_num}...")
+        feat = first_batch[f'layer_{layer_idx}']
+        layer_tensors[layer_num] = torch.empty((entire_dataset_length, *feat.shape[1:]), dtype=feat.dtype)
+    del first_batch
+    gc.collect()
 
-        sample_shape = None
-        sample_dtype = None
-        for step in range(num_batches):
-            batch_data = torch.load(os.path.join(batch_temp_dir, f"batch_{step}.pt"), map_location='cpu', weights_only=False)
-            feat = batch_data[f'layer_{layer_idx}']
-            sample_shape = feat.shape[1:]
-            sample_dtype = feat.dtype
-            del batch_data, feat
+    current_idx = 0
+    for step in tqdm(range(num_batches), desc=f"[{split_name}] Merging all layers"):
+        batch_data = torch.load(os.path.join(batch_temp_dir, f"batch_{step}.pt"), map_location='cpu', weights_only=False)
 
-        layer_tensor = torch.empty((entire_dataset_length, *sample_shape), dtype=sample_dtype)
+        rows = batch_data[f'layer_{TARGET_LAYERS[0] - 1}'].shape[0]
+        for layer_num in TARGET_LAYERS:
+            layer_idx = layer_num - 1
+            layer_tensors[layer_num][current_idx: current_idx + rows] = batch_data[f'layer_{layer_idx}']
+        current_idx += rows
 
-        current_idx = 0
-        for step in tqdm(range(num_batches), desc=f"[{split_name}] Merging Layer {layer_num}"):
-            batch_data = torch.load(os.path.join(batch_temp_dir, f"batch_{step}.pt"), map_location='cpu', weights_only=False)
-            feat = batch_data[f'layer_{layer_idx}']
+        del batch_data
 
-            rows = feat.shape[0]
-            layer_tensor[current_idx: current_idx + rows] = feat
-            current_idx += rows
+    gc.collect()
+    torch.cuda.empty_cache()
 
-            del batch_data, feat
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
+    for layer_num in TARGET_LAYERS:
+        layer_tensor = layer_tensors.pop(layer_num)
         print(f"[{split_name}] Final shape for Layer {layer_num} = {layer_tensor.shape}")
 
         save_dict = {"x": layer_tensor, "y": y_tensor, "s": s_list}
@@ -586,7 +587,8 @@ def extract_and_merge_split(split_name, dataset, model, temp_dir, device, batch_
 
         del layer_tensor, save_dict
         gc.collect()
-        torch.cuda.empty_cache()
+
+    torch.cuda.empty_cache()
 
     for step in range(num_batches):
         batch_file = os.path.join(batch_temp_dir, f"batch_{step}.pt")
