@@ -139,6 +139,8 @@ def resume_merge(pipeline, split_name):
 
 
 if __name__ == "__main__":
+    import sys
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("dataset", choices=["TUAB", "TUEV"], help="어떤 통합 스크립트의 temp를 재개할지")
     parser.add_argument("split", choices=["train", "valid", "test"], help="재개할 split")
@@ -146,5 +148,10 @@ if __name__ == "__main__":
 
     module_name = f"feature_extraction_and_linear_probe_{args.dataset}"
     pipeline = importlib.import_module(module_name)
+
+    # pipeline.get_args()가 내부적으로 argparse.parse_args()로 sys.argv를 그대로
+    # 다시 파싱하므로, 우리가 여기서 받은 "TUAB"/"train" 같은 인자가 남아있으면
+    # "unrecognized arguments" 에러가 난다. get_args() 호출 전에 비워준다.
+    sys.argv = sys.argv[:1]
 
     resume_merge(pipeline, args.split)
