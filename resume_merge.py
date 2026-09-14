@@ -92,42 +92,53 @@ def resume_merge(pipeline, split_name):
     del y_list
     gc.collect()
 
-    # ---- 여기서부터는 수정된(1-pass) merge 로직과 동일 ----
-    print(f"[{split_name}] Pre-allocating tensors for {len(pipeline.TARGET_LAYERS)} layers...")
-    first_batch = torch.load(os.path.join(batch_temp_dir, "batch_0.pt"), map_location='cpu', weights_only=False)
-    layer_tensors = {}
-    for layer_num in pipeline.TARGET_LAYERS:
-        layer_idx = layer_num - 1
-        feat = first_batch[f'layer_{layer_idx}']
-        layer_tensors[layer_num] = torch.empty((entire_dataset_length, *feat.shape[1:]), dtype=feat.dtype)
-    del first_batch
-    gc.collect()
-
-    current_idx = 0
-    for step in tqdm(range(num_batches), desc=f"[{split_name}] Merging all layers"):
-        batch_data = torch.load(os.path.join(batch_temp_dir, f"batch_{step}.pt"), map_location='cpu', weights_only=False)
-        rows = batch_data[f'layer_{pipeline.TARGET_LAYERS[0] - 1}'].shape[0]
-        for layer_num in pipeline.TARGET_LAYERS:
-            layer_idx = layer_num - 1
-            layer_tensors[layer_num][current_idx: current_idx + rows] = batch_data[f'layer_{layer_idx}']
-        current_idx += rows
-        del batch_data
-
-    gc.collect()
-    torch.cuda.empty_cache()
+    # ---- 여기서부터는 수정된(chunk 단위 merge) 로직과 동일 ----
+    # LAYER_MERGE_CHUNK_SIZE개 layer씩 묶어서 배치를 순회하며 채운다. chunk_size가
+    # 클수록 배치 파일을 다시 읽는 횟수는 줄지만 그만큼 layer tensor를 동시에
+    # 메모리에 들고 있어야 하므로, RAM이 부족하면 pipeline 모듈의
+    # LAYER_MERGE_CHUNK_SIZE를 줄여야 한다. (구버전 pipeline 모듈과의 호환을 위해
+    # 없으면 가장 안전한 1로 처리)
+    chunk_size = getattr(pipeline, "LAYER_MERGE_CHUNK_SIZE", 1)
+    target_layers = pipeline.TARGET_LAYERS
+    layer_chunks = [target_layers[i:i + chunk_size] for i in range(0, len(target_layers), chunk_size)]
 
     layer_paths = {}
-    for layer_num in pipeline.TARGET_LAYERS:
-        layer_tensor = layer_tensors.pop(layer_num)
-        print(f"[{split_name}] Final shape for Layer {layer_num} = {layer_tensor.shape}")
-
-        save_dict = {"x": layer_tensor, "y": y_tensor, "s": s_list}
-        layer_path = os.path.join(split_temp_dir, f"layer_{layer_num}.pt")
-        torch.save(save_dict, layer_path)
-        layer_paths[layer_num] = layer_path
-
-        del layer_tensor, save_dict
+    for chunk in layer_chunks:
+        print(f"[{split_name}] Pre-allocating tensors for layers {chunk}...")
+        first_batch = torch.load(os.path.join(batch_temp_dir, "batch_0.pt"), map_location='cpu', weights_only=False)
+        layer_tensors = {}
+        for layer_num in chunk:
+            layer_idx = layer_num - 1
+            feat = first_batch[f'layer_{layer_idx}']
+            layer_tensors[layer_num] = torch.empty((entire_dataset_length, *feat.shape[1:]), dtype=feat.dtype)
+        del first_batch
         gc.collect()
+
+        current_idx = 0
+        for step in tqdm(range(num_batches), desc=f"[{split_name}] Merging layers {chunk}"):
+            batch_data = torch.load(os.path.join(batch_temp_dir, f"batch_{step}.pt"), map_location='cpu', weights_only=False)
+            rows = batch_data[f'layer_{chunk[0] - 1}'].shape[0]
+            for layer_num in chunk:
+                layer_idx = layer_num - 1
+                layer_tensors[layer_num][current_idx: current_idx + rows] = batch_data[f'layer_{layer_idx}']
+            current_idx += rows
+            del batch_data
+
+        gc.collect()
+
+        for layer_num in chunk:
+            layer_tensor = layer_tensors.pop(layer_num)
+            print(f"[{split_name}] Final shape for Layer {layer_num} = {layer_tensor.shape}")
+
+            save_dict = {"x": layer_tensor, "y": y_tensor, "s": s_list}
+            layer_path = os.path.join(split_temp_dir, f"layer_{layer_num}.pt")
+            torch.save(save_dict, layer_path)
+            layer_paths[layer_num] = layer_path
+
+            del layer_tensor, save_dict
+            gc.collect()
+
+    torch.cuda.empty_cache()
 
     # batch 파일은 여기서 지우지 않는다 (문제 생기면 재시도할 수 있도록 남겨둠).
     # 확인 후 필요하면 batch_temp_dir을 직접 삭제해도 된다.
