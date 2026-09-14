@@ -853,6 +853,34 @@ def run_layer_experiment(
     return test_metrics
 
 
+def existing_layer_paths(split_temp_dir):
+    """
+    이미 temp_dir/{split}/layer_{n}.pt 가 전부 존재하면 그 경로들을 반환하고,
+    하나라도 없으면 None을 반환한다. (중단된 실행을 재개할 때 이미 끝난 split의
+    feature 추출을 다시 하지 않기 위함)
+    """
+    layer_paths = {}
+    for layer_num in TARGET_LAYERS:
+        layer_path = os.path.join(split_temp_dir, f"layer_{layer_num}.pt")
+        if not os.path.exists(layer_path):
+            return None
+        layer_paths[layer_num] = layer_path
+    return layer_paths
+
+
+def get_split_layer_paths(split_name, dataset, model, temp_dir, device):
+    """
+    temp_dir/{split}/layer_{n}.pt 가 이미 모두 있으면(예: resume_merge.py로 미리
+    병합해둔 경우) 추출을 건너뛰고 그 경로를 그대로 쓰고, 없으면 처음부터 추출한다.
+    """
+    split_temp_dir = os.path.join(temp_dir, split_name)
+    cached = existing_layer_paths(split_temp_dir)
+    if cached is not None:
+        print(f"[{split_name}] layer_*.pt가 이미 존재합니다. feature 추출을 건너뜁니다.")
+        return cached
+    return extract_and_merge_split(split_name, dataset, model, temp_dir, device)
+
+
 def seed_torch(seed=1029):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -887,9 +915,9 @@ if __name__ == "__main__":
     os.makedirs(TEMP_ROOT, exist_ok=True)
 
     # --- 1) 모든 split에 대해 layer-wise feature 추출 (temp 폴더에만 저장) ---
-    train_layer_paths = extract_and_merge_split("train", train_dataset, model, TEMP_ROOT, device)
-    valid_layer_paths = extract_and_merge_split("valid", val_dataset, model, TEMP_ROOT, device)
-    test_layer_paths = extract_and_merge_split("test", test_dataset, model, TEMP_ROOT, device)
+    train_layer_paths = get_split_layer_paths("train", train_dataset, model, TEMP_ROOT, device)
+    valid_layer_paths = get_split_layer_paths("valid", val_dataset, model, TEMP_ROOT, device)
+    test_layer_paths = get_split_layer_paths("test", test_dataset, model, TEMP_ROOT, device)
 
     # feature 추출이 끝났으므로 모델을 GPU에서 내려 probe 학습에 메모리를 확보
     model.to('cpu')
