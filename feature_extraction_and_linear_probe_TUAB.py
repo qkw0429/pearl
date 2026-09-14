@@ -107,7 +107,7 @@ PROBE_BATCH_SIZE = 128
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 10
-DROPOUT_P = 0.8  # 실제 self.head(nn.Dropout(0.8) + LinearWithConstraint)와 동일하게 맞춤
+DROPOUT_P = 0.5  # 실제 self.head(nn.Dropout(0.5) + LinearWithConstraint)와 동일하게 맞춤
 
 TEMP_ROOT = f"/workspace/EEGPT/temp/TUAB/{NOTRAIN_LINEAR_OR_FINETUNE_OR_PEARL_LORA_OR_DORA_VERA_OR_DYNAMICPEARL}"
 LOG_ROOT = f"/workspace/EEGPT/log/TUAB_layerwise_probe_log/{DATE}/{NOTRAIN_LINEAR_OR_FINETUNE_OR_PEARL_LORA_OR_DORA_VERA_OR_DYNAMICPEARL}_model/SEED_0"
@@ -625,12 +625,12 @@ class StructuredProbe(nn.Module):
     NOTRAIN_LINEAR_OR_FINETUNE_OR_PEARL_LORA_OR_DORA_VERA_OR_DYNAMICPEARL 값에 따라
     만드는 모델(Modules/models/EEGPT_mcae_finetune_change_for_linear_wise_invest.py의
     EEGPTClassifier / EEGPTClassifier_rep_conv / EEGPTClassifier_rep_MULTI_SCALE_DYNAMIC_CONV)의
-    self.head와 동일하게 nn.Dropout(0.8) + LinearWithConstraint(in_features, num_classes)이며,
+    self.head와 동일하게 nn.Dropout(0.5) + LinearWithConstraint(in_features, num_classes)이며,
     forward에서도 실제 모델과 동일하게 (N_time_patch, EMBED_NUM, D)를 통째로 flatten해서 head에 넣는다.
     in_features는 실제 추출된 feature의 shape(N_time_patch * EMBED_NUM * D)에서 그대로 가져오므로
     모델별 patch 개수 차이는 자동으로 반영된다.
     """
-    def __init__(self, model_name, embed_num, embed_dim, num_time_patch, num_outputs, dropout_p=0.8):
+    def __init__(self, model_name, embed_num, embed_dim, num_time_patch, num_outputs, dropout_p=0.5):
         super().__init__()
         in_features = num_time_patch * embed_num * embed_dim
 
