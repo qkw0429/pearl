@@ -103,8 +103,7 @@ PROBE_BATCH_SIZE = 128
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 10
-HIDDEN_DIM = 16
-DROPOUT_P = 0.5
+DROPOUT_P = 0.8  # 실제 self.head(nn.Dropout(0.8) + LinearWithConstraint)와 동일하게 맞춤
 
 TEMP_ROOT = f"/workspace/EEGPT/temp/TUEV/{NOTRAIN_LINEAR_OR_FINETUNE_OR_PEARL_LORA_OR_DORA_VERA_OR_DYNAMICPEARL}"
 LOG_ROOT = f"/workspace/EEGPT/log/TUEV_layerwise_probe_log/{DATE}/{NOTRAIN_LINEAR_OR_FINETUNE_OR_PEARL_LORA_OR_DORA_VERA_OR_DYNAMICPEARL}_model/SEED_0"
@@ -604,25 +603,67 @@ def extract_and_merge_split(split_name, dataset, model, temp_dir, device, batch_
 # 2. Linear probe (StructuredProbe, same format as BCIC-2A linear_probe.py)
 # ==========================================
 
-class StructuredProbe(nn.Module):
+class LinearWithConstraint(nn.Linear):
     """
-    main 실험에서 실제로 학습된 linear_probe1/2와 동일한 factorized 구조를 갖되,
-    가중치는 불러오지 않고 매번 무작위 초기화해서 새로 학습하는 "공정한" probe.
+    Modules/models/*(EEGPTClassifier 계열)의 self.head에서 실제로 쓰이는 것과 동일한
+    max-norm 제약이 걸린 Linear layer (EEGNet 스타일 weight constraint).
     """
-    def __init__(self, embed_num, embed_dim, num_time_patch, hidden_dim, num_outputs, dropout_p=0.5):
-        super().__init__()
-        self.probe1 = nn.Linear(embed_num * embed_dim, hidden_dim)
-        self.probe2 = nn.Linear(num_time_patch * hidden_dim, num_outputs)
-        self.dropout = nn.Dropout(p=dropout_p)
+    def __init__(self, *args, doWeightNorm=True, max_norm=1, **kwargs):
+        self.max_norm = max_norm
+        self.doWeightNorm = doWeightNorm
+        super().__init__(*args, **kwargs)
 
     def forward(self, x):
-        # x: (B, N_time_patch, EMBED_NUM, D)
-        B, N, E, D = x.shape
-        h = self.dropout(x.reshape(B, N, E * D))
-        h = self.probe1(h)      # (B, N_time_patch, hidden_dim)
-        h = h.reshape(B, -1)    # (B, N_time_patch * hidden_dim)
-        h = self.probe2(h)      # (B, num_outputs)
-        return h
+        if self.doWeightNorm:
+            self.weight.data = torch.renorm(self.weight.data, p=2, dim=0, maxnorm=self.max_norm)
+        return super().forward(x)
+
+
+class StructuredProbe(nn.Module):
+    """
+    무작위 초기화 후 새로 학습하는 "공정한" probe이되, 실제 self.head 구조를 그대로
+    재현한다. self.head는 feature_extraction_and_linear_probe_TUEV.py의 get_models()가
+    NOTRAIN_LINEAR_OR_FINETUNE_OR_PEARL_LORA_OR_DORA_VERA_OR_DYNAMICPEARL 값에 따라
+    만드는 모델(Modules/models/EEGPT_mcae_finetune_change_tuev_for_linear_wise_invest.py의
+    EEGPTClassifier / EEGPTClassifier_rep_conv / EEGPTClassifier_rep_MULTI_SCALE_DYNAMIC_CONV)의
+    self.head와 동일하게 nn.Dropout(0.8) + LinearWithConstraint(in_features, num_classes)이며,
+    forward에서도 실제 모델과 동일하게 (N_time_patch, EMBED_NUM, D)를 통째로 flatten해서 head에 넣는다.
+    in_features는 실제 추출된 feature의 shape(N_time_patch * EMBED_NUM * D)에서 그대로 가져오므로
+    모델별 patch 개수 차이는 자동으로 반영된다.
+    """
+    def __init__(self, model_name, embed_num, embed_dim, num_time_patch, num_outputs, dropout_p=0.8):
+        super().__init__()
+        in_features = num_time_patch * embed_num * embed_dim
+
+        if model_name == 'PEARL':
+            # EEGPTClassifier_rep_conv.self.head
+            self.head = nn.Sequential(
+                nn.Dropout(dropout_p),
+                LinearWithConstraint(in_features, num_outputs),
+            )
+        elif model_name == 'DYNAMICPEARL':
+            # EEGPTClassifier_rep_MULTI_SCALE_DYNAMIC_CONV.self.head
+            self.head = nn.Sequential(
+                nn.Dropout(dropout_p),
+                LinearWithConstraint(in_features, num_outputs),
+            )
+        elif model_name == 'FINETUNE':
+            # EEGPTClassifier(use_chan_conv=True).self.head
+            self.head = nn.Sequential(
+                nn.Dropout(dropout_p),
+                LinearWithConstraint(in_features, num_outputs),
+            )
+        else:
+            # NOTRAIN / LINEAR / LORA / DORA / VERA -> EEGPTClassifier(use_chan_conv=False).self.head
+            self.head = nn.Sequential(
+                nn.Dropout(dropout_p),
+                LinearWithConstraint(in_features, num_outputs),
+            )
+
+    def forward(self, x):
+        # x: (B, N_time_patch, EMBED_NUM, D) -> 실제 모델의 forward(x.flatten(1))와 동일
+        x = x.flatten(1)
+        return self.head(x)
 
 
 def compute_loss(logits, y, output_type):
@@ -688,8 +729,8 @@ def run_layer_experiment(
     lr=LR,
     weight_decay=WEIGHT_DECAY,
     patience=PATIENCE,
-    hidden_dim=HIDDEN_DIM,
     dropout_p=DROPOUT_P,
+    model_name=NOTRAIN_LINEAR_OR_FINETUNE_OR_PEARL_LORA_OR_DORA_VERA_OR_DYNAMICPEARL,
 ):
     probe_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n>>> [Layer {layer_num}] 실험 시작 (Device: {probe_device})")
@@ -707,10 +748,10 @@ def run_layer_experiment(
     print(f"[Layer {layer_num}] feature shape = (N_time_patch={num_time_patch}, "
         f"EMBED_NUM={embed_num}, D={embed_dim})")
     probe = StructuredProbe(
+        model_name=model_name,
         embed_num=embed_num,
         embed_dim=embed_dim,
         num_time_patch=num_time_patch,
-        hidden_dim=hidden_dim,
         num_outputs=num_outputs,
         dropout_p=dropout_p,
     ).to(probe_device)
