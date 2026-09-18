@@ -93,12 +93,6 @@ else:
 # feature 추출 시 배치 크기
 EXTRACT_BATCH_SIZE = 200
 
-# layer merge 시 한 번에 메모리에 올려서 채우는 layer 개수. 클수록 배치 파일을
-# 다시 읽는 횟수가 줄어 빠르지만, 그만큼 layer tensor를 동시에 메모리에 들고 있어야
-# 한다. 메모리가 부족하면 1로 낮추고(가장 느리지만 가장 안전), 여유가 있으면
-# TARGET_LAYERS 개수(8)까지 올려도 된다.
-LAYER_MERGE_CHUNK_SIZE = 1
-
 # linear probe 학습 관련 설정
 DATE = datetime.datetime.now().strftime('%y%m%d_%H%M%S') + '_TUEV_LAYER_WISE_LINEAR_PROBE'
 OUTPUT_TYPE = "multiclass"  # TUEV는 6-class 분류
@@ -500,15 +494,31 @@ def load_model_checkpoint(model, opts):
 def extract_and_merge_split(split_name, dataset, model, temp_dir, device, batch_size=EXTRACT_BATCH_SIZE):
     """
     한 split(train/valid/test)에 대해 모든 layer의 feature를 추출한다.
-    배치 단위 feature는 temp_dir/{split}/batches 에 임시 저장했다가 layer별로
-    병합한 뒤 temp_dir/{split}/layer_{n}.pt 로 저장하고 배치 파일은 삭제한다.
-    (전체 feature를 CPU/GPU 메모리에 한 번에 올리지 않기 위함)
+
+    배치 단위 feature는 layer별로 분리해서
+    temp_dir/{split}/batches/layer_{layer_idx}/batch_{step}.pt 에 임시 저장한다.
+    (기존에는 배치 하나에 8개 layer를 한 dict로 묶어 파일 하나로 저장했는데, 그러면
+    merge 시 layer 1개만 필요해도 torch.load가 파일 안의 8개 layer를 전부 역직렬화
+    해야 했다. layer별로 파일을 완전히 분리하면 그 layer의 파일만 읽으면 되고 다른
+    layer의 데이터는 전혀 건드리지 않는다.)
+
+    layer마다 자기 파일들만 한 번씩 읽어 temp_dir/{split}/layer_{n}.pt 로 병합/저장한
+    뒤 배치 임시 파일은 삭제한다. (전체 feature를 CPU/GPU 메모리에 한 번에 올리지
+    않기 위함 — layer를 항상 하나씩만 메모리에 올린다. layer별로 파일이 분리되어
+    있어 여러 layer를 묶어서 읽어도 I/O 이득이 없으므로, 메모리를 가장 적게 쓰는
+    "한 번에 layer 1개" 방식이 곧 최선이다.)
     """
     loader = DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=False)
 
     split_temp_dir = os.path.join(temp_dir, split_name)
     batch_temp_dir = os.path.join(split_temp_dir, "batches")
-    os.makedirs(batch_temp_dir, exist_ok=True)
+
+    layer_batch_dirs = {}
+    for layer_num in TARGET_LAYERS:
+        layer_idx = layer_num - 1
+        layer_batch_dir = os.path.join(batch_temp_dir, f"layer_{layer_idx}")
+        os.makedirs(layer_batch_dir, exist_ok=True)
+        layer_batch_dirs[layer_idx] = layer_batch_dir
 
     y_list = []
     s_list = []
@@ -522,7 +532,6 @@ def extract_and_merge_split(split_name, dataset, model, temp_dir, device, batch_
             with torch.amp.autocast('cuda'):
                 features = model(inputs)
 
-            batch_features_dict = {}
             for layer_num in TARGET_LAYERS:
                 layer_idx = layer_num - 1
                 feat = features[layer_idx]
@@ -531,11 +540,11 @@ def extract_and_merge_split(split_name, dataset, model, temp_dir, device, batch_
                 feat_reshaped = feat_reshaped[..., -4:, :]
 
                 if len(POOLING) != 0:
-                    batch_features_dict[f'layer_{layer_idx}'] = feat_reshaped.mean(dim=POOLING)
+                    feat_to_save = feat_reshaped.mean(dim=POOLING)
                 else:
-                    batch_features_dict[f'layer_{layer_idx}'] = feat_reshaped
+                    feat_to_save = feat_reshaped
 
-            torch.save(batch_features_dict, os.path.join(batch_temp_dir, f"batch_{step}.pt"))
+                torch.save(feat_to_save, os.path.join(layer_batch_dirs[layer_idx], f"batch_{step}.pt"))
 
             y_list.append(labels)
             s_list.extend(subject_ids.tolist() if torch.is_tensor(subject_ids) else subject_ids)
@@ -547,65 +556,44 @@ def extract_and_merge_split(split_name, dataset, model, temp_dir, device, batch_
     print(f"[{split_name}] dataset length = {entire_dataset_length}")
 
     y_tensor = torch.cat(y_list, dim=0)
-    del y_list, batch_features_dict, feat_reshaped
+    del y_list
     torch.cuda.empty_cache()
     gc.collect()
 
     num_batches = len(loader)
     layer_paths = {}
 
-    # 배치 파일 하나에 모든 layer가 함께 저장되어 있으므로, 배치 파일을 반복해서
-    # 다시 읽지 않도록 LAYER_MERGE_CHUNK_SIZE개 layer씩 묶어서 배치를 순회하며 채운다.
-    # (chunk_size가 클수록 디스크 I/O는 줄지만 layer tensor를 그만큼 동시에 메모리에
-    # 올려야 하므로, RAM이 부족하면 LAYER_MERGE_CHUNK_SIZE를 줄여야 한다.)
-    layer_chunks = [
-        TARGET_LAYERS[i:i + LAYER_MERGE_CHUNK_SIZE]
-        for i in range(0, len(TARGET_LAYERS), LAYER_MERGE_CHUNK_SIZE)
-    ]
+    for layer_num in TARGET_LAYERS:
+        layer_idx = layer_num - 1
+        layer_batch_dir = layer_batch_dirs[layer_idx]
 
-    for chunk in layer_chunks:
-        print(f"[{split_name}] Pre-allocating tensors for layers {chunk}...")
-        first_batch = torch.load(os.path.join(batch_temp_dir, "batch_0.pt"), map_location='cpu', weights_only=False)
-        layer_tensors = {}
-        for layer_num in chunk:
-            layer_idx = layer_num - 1
-            feat = first_batch[f'layer_{layer_idx}']
-            layer_tensors[layer_num] = torch.empty((entire_dataset_length, *feat.shape[1:]), dtype=feat.dtype)
+        first_batch = torch.load(os.path.join(layer_batch_dir, "batch_0.pt"), map_location='cpu', weights_only=False)
+        layer_tensor = torch.empty((entire_dataset_length, *first_batch.shape[1:]), dtype=first_batch.dtype)
         del first_batch
-        gc.collect()
 
         current_idx = 0
-        for step in tqdm(range(num_batches), desc=f"[{split_name}] Merging layers {chunk}"):
-            batch_data = torch.load(os.path.join(batch_temp_dir, f"batch_{step}.pt"), map_location='cpu', weights_only=False)
-
-            rows = batch_data[f'layer_{chunk[0] - 1}'].shape[0]
-            for layer_num in chunk:
-                layer_idx = layer_num - 1
-                layer_tensors[layer_num][current_idx: current_idx + rows] = batch_data[f'layer_{layer_idx}']
+        for step in tqdm(range(num_batches), desc=f"[{split_name}] Merging Layer {layer_num}"):
+            feat = torch.load(os.path.join(layer_batch_dir, f"batch_{step}.pt"), map_location='cpu', weights_only=False)
+            rows = feat.shape[0]
+            layer_tensor[current_idx: current_idx + rows] = feat
             current_idx += rows
-
-            del batch_data
+            del feat
 
         gc.collect()
 
-        for layer_num in chunk:
-            layer_tensor = layer_tensors.pop(layer_num)
-            print(f"[{split_name}] Final shape for Layer {layer_num} = {layer_tensor.shape}")
+        print(f"[{split_name}] Final shape for Layer {layer_num} = {layer_tensor.shape}")
 
-            save_dict = {"x": layer_tensor, "y": y_tensor, "s": s_list}
-            layer_path = os.path.join(split_temp_dir, f"layer_{layer_num}.pt")
-            torch.save(save_dict, layer_path)
-            layer_paths[layer_num] = layer_path
+        save_dict = {"x": layer_tensor, "y": y_tensor, "s": s_list}
+        layer_path = os.path.join(split_temp_dir, f"layer_{layer_num}.pt")
+        torch.save(save_dict, layer_path)
+        layer_paths[layer_num] = layer_path
 
-            del layer_tensor, save_dict
-            gc.collect()
+        del layer_tensor, save_dict
+        gc.collect()
 
     torch.cuda.empty_cache()
 
-    for step in range(num_batches):
-        batch_file = os.path.join(batch_temp_dir, f"batch_{step}.pt")
-        if os.path.exists(batch_file):
-            os.remove(batch_file)
+    shutil.rmtree(batch_temp_dir, ignore_errors=True)
 
     print(f"[{split_name}] feature extraction & merge complete.")
     return layer_paths
