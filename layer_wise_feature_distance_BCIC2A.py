@@ -75,20 +75,27 @@ def apply_slicing(x, embed_num):
     return x[..., -embed_num:, :]
 
 
-def match_time_length(x, ref_time_len):
+def crop_to_last(x, target_time_len):
+    # x: [N, C, T, D] -> 뒤쪽 target_time_len개 time token만 사용
+    return x[..., -target_time_len:, :]
+
+
+def match_time_length(r, o):
     """
     raw + flatten 조합에서만 사용.
-    dynamic_pearl처럼 prompt로 인해 time token 수가 reference보다 많은 경우,
-    뒤쪽 ref_time_len개만 남기고 앞쪽(prompt 관련 토큰)을 잘라 길이를 맞춥니다.
+    method마다 저장된 time token 수가 다를 수 있으므로(dynamic_pearl의 prompt 등),
+    어느 쪽이 더 길든 상관없이 둘 다 뒤쪽 min(len_r, len_o)개로 잘라 길이를 맞춥니다.
     """
-    cur_time_len = x.shape[-2]
-    if cur_time_len == ref_time_len:
-        return x
-    if cur_time_len < ref_time_len:
-        raise ValueError(
-            f"feature의 time token 수({cur_time_len})가 reference({ref_time_len})보다 적습니다."
-        )
-    return x[..., -ref_time_len:, :]
+    r_time_len = r.shape[-2]
+    o_time_len = o.shape[-2]
+    min_time_len = min(r_time_len, o_time_len)
+
+    if r_time_len != min_time_len:
+        r = crop_to_last(r, min_time_len)
+    if o_time_len != min_time_len:
+        o = crop_to_last(o, min_time_len)
+
+    return r, o
 
 
 def to_flatten(x):
@@ -101,7 +108,7 @@ def to_pooling(x):
     return x.mean(dim=(1, 2))
 
 
-def build_feature_pair(ref_x, other_x, slicing_mode, feature_mode, embed_num, ref_raw_time_len):
+def build_feature_pair(ref_x, other_x, slicing_mode, feature_mode, embed_num):
     """
     ref_x, other_x: 원본 raw feature [N, C, T, D] (아직 아무 처리도 하지 않은 상태)
     slicing_mode: 'raw' 또는 'sliced'
@@ -112,13 +119,13 @@ def build_feature_pair(ref_x, other_x, slicing_mode, feature_mode, embed_num, re
 
     if slicing_mode == "sliced":
         # 모든 method에서 뒤쪽 embed_num개 time token만 사용하므로
-        # dynamic_pearl의 prompt 토큰 여부와 무관하게 길이가 embed_num으로 통일됨
+        # method간 원본 time token 수 차이와 무관하게 길이가 embed_num으로 통일됨
         r = apply_slicing(r, embed_num)
         o = apply_slicing(o, embed_num)
     else:  # raw
         if feature_mode == "flatten":
-            # flatten은 원소 단위 정렬이 필요하므로 time token 길이를 reference 기준으로 맞춤
-            o = match_time_length(o, ref_raw_time_len)
+            # flatten은 원소 단위 정렬이 필요하므로 두 feature의 time token 길이를 서로 맞춤
+            r, o = match_time_length(r, o)
         # pooling은 time 축을 평균으로 없애버리므로 길이가 달라도 그대로 사용
 
     if feature_mode == "flatten":
@@ -174,7 +181,6 @@ def main():
             ref_x = load_raw_feature(DATASET_PATH, split_dir, ref_folder, layer, filename)
             if ref_x is None:
                 continue
-            ref_raw_time_len = ref_x.shape[-2]
             ref_x = ref_x.to(DEVICE)
 
             for method_name, method_folder in METHODS.items():
@@ -197,7 +203,7 @@ def main():
                 for slicing_mode in SLICING_MODES:
                     for feature_mode in FEATURE_MODES:
                         r_vec, o_vec = build_feature_pair(
-                            ref_x, other_x, slicing_mode, feature_mode, EMBED_NUM, ref_raw_time_len
+                            ref_x, other_x, slicing_mode, feature_mode, EMBED_NUM
                         )
 
                         same_idx_dist = cosine_distance_same_index(r_vec, o_vec)
