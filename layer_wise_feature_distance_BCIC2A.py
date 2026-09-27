@@ -37,7 +37,7 @@ METHODS = {
 }
 
 LAYERS = range(1, 9)
-EMBED_NUM = 4  # sliced feature에서 사용할, 뒤쪽 time token 개수
+EMBED_NUM = 4  # sliced feature에서 사용할, channel 축 뒤쪽 summary token 개수
 
 SLICING_MODES = ["raw", "sliced"]     # raw: 원본 feature, sliced: x[..., -EMBED_NUM:, :]
 FEATURE_MODES = ["flatten", "pooling"]  # flatten: 그대로 펼침, pooling: channel/time 축 평균
@@ -59,7 +59,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def load_raw_feature(dataset_path, split_dir, model_folder, layer_num, filename):
     """
     저장된 레이어별 feature(.pt)를 원본 shape 그대로 불러옵니다.
-    반환 shape: [N, time_token, channel_token, embed_dim]
+    반환 shape: [N, time_patch, channel(=실채널 수 + embed_num summary token), embed_dim]
     """
     layer_dir = f"{dataset_path}/{split_dir}/{model_folder}_model/{SUB_TAG}/layer_{layer_num}"
     file_path = os.path.join(layer_dir, filename)
@@ -77,8 +77,11 @@ def load_raw_feature(dataset_path, split_dir, model_folder, layer_num, filename)
 # 2. feature 변환 (slicing / flatten / pooling)
 # ==========================================
 def apply_slicing(x, embed_num):
-    # x: [N, T, C, D] -> [N, embed_num, C, D] (time_token 축(dim=1)에서 뒤쪽 embed_num개만 사용)
-    return x[:, -embed_num:, :, :]
+    # x: [N, T, C, D] -> [N, T, embed_num, D]
+    # channel 축(dim=2, 크기 = 실채널 수 + embed_num)에서 뒤쪽 embed_num개만 사용.
+    # 이는 모델이 forward 마지막에 x[:, -summary_token.shape[1]:, :]로 하는 것과 동일한 연산으로,
+    # 실채널 출력은 버리고 모델이 학습한 summary token만 남기는 것.
+    return x[:, :, -embed_num:, :]
 
 
 def crop_to_last(x, target_time_len):
@@ -126,19 +129,19 @@ def build_feature_pair(ref_x, other_x, slicing_mode, feature_mode, embed_num):
     r, o = ref_x, other_x
 
     if slicing_mode == "sliced":
-        # 모든 method에서 뒤쪽 embed_num개 time token만 사용하므로
-        # method간 원본 time token 수 차이와 무관하게 길이가 embed_num으로 통일됨
+        # 모든 method에서 channel 축의 뒤쪽 embed_num개(summary token)만 사용하므로
+        # method간 실채널 수 차이(예: finetune)와 무관하게 channel 축 크기가 embed_num으로 통일됨
         r = apply_slicing(r, embed_num)
         o = apply_slicing(o, embed_num)
-    else:  # raw
-        if feature_mode == "flatten":
-            # flatten은 원소 단위 정렬이 필요하므로 두 feature의 time token 길이를 서로 맞춤
-            r, o = match_time_length(r, o)
-        # pooling은 time 축을 평균으로 없애버리므로 길이가 달라도 그대로 사용
+    # slicing 여부와 무관하게, flatten은 time 축(dim=1) 길이가 다르면(예: dynamic_pearl의 prompt)
+    # 정렬이 깨지므로 아래에서 항상 맞춰줌
 
     if feature_mode == "flatten":
+        # flatten은 원소 단위 정렬이 필요하므로 두 feature의 time token 길이를 서로 맞춤
+        r, o = match_time_length(r, o)
         # channel 축(dim=2) 개수가 다르면 같은 위치의 값이 서로 다른 채널을 의미하게 되어
-        # flatten 비교 자체가 성립하지 않으므로(예: finetune의 학습된 채널 변환) 건너뜀
+        # flatten 비교 자체가 성립하지 않으므로(예: raw 모드에서 finetune의 실채널 수 차이) 건너뜀.
+        # sliced 모드에서는 channel 축이 항상 embed_num으로 통일되어 있어 이 조건에 걸리지 않음.
         if r.shape[2] != o.shape[2]:
             return None, None
         r_vec = to_flatten(r)
