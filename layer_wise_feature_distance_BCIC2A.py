@@ -39,12 +39,6 @@ METHODS = {
 LAYERS = range(1, 9)
 EMBED_NUM = 4  # sliced feature에서 사용할, 뒤쪽 time token 개수
 
-# 원본 feature shape [N, ?, ?, D]에서 time token이 위치한 축 번호.
-# BCIC2A는 (N, channel, time, D) 순서라 time이 뒤에서 두 번째 축(-2).
-# 데이터셋마다 channel/time 축 순서가 다를 수 있으므로(예: PhysioP300은
-# (N, time, channel, D) 순서), 그 데이터셋에 맞게 이 값만 바꿔주면 됨.
-TIME_AXIS = -2
-
 SLICING_MODES = ["raw", "sliced"]     # raw: 원본 feature, sliced: x[..., -EMBED_NUM:, :]
 FEATURE_MODES = ["flatten", "pooling"]  # flatten: 그대로 펼침, pooling: channel/time 축 평균
 
@@ -82,33 +76,30 @@ def load_raw_feature(dataset_path, split_dir, model_folder, layer_num, filename)
 # ==========================================
 # 2. feature 변환 (slicing / flatten / pooling)
 # ==========================================
-def take_last_n_along_axis(x, n, axis):
-    # x의 axis 축에서 뒤쪽 n개만 잘라서 반환 (축 위치에 상관없이 동작)
-    axis = axis % x.dim()
-    index = torch.arange(x.shape[axis] - n, x.shape[axis], device=x.device)
-    return x.index_select(axis, index)
+def apply_slicing(x, embed_num):
+    # x: [N, C, T, D] -> [N, C, embed_num, D] (뒤쪽 embed_num개 time token만 사용)
+    return x[..., -embed_num:, :]
 
 
-def apply_slicing(x, embed_num, time_axis=TIME_AXIS):
-    # time_axis 축에서 뒤쪽 embed_num개 time token만 사용
-    return take_last_n_along_axis(x, embed_num, time_axis)
+def crop_to_last(x, target_time_len):
+    # x: [N, C, T, D] -> 뒤쪽 target_time_len개 time token만 사용
+    return x[..., -target_time_len:, :]
 
 
-def match_time_length(r, o, time_axis=TIME_AXIS):
+def match_time_length(r, o):
     """
     raw + flatten 조합에서만 사용.
     method마다 저장된 time token 수가 다를 수 있으므로(dynamic_pearl의 prompt 등),
-    어느 쪽이 더 길든 상관없이 둘 다 time_axis 축 기준 뒤쪽 min(len_r, len_o)개로 잘라 길이를 맞춥니다.
+    어느 쪽이 더 길든 상관없이 둘 다 뒤쪽 min(len_r, len_o)개로 잘라 길이를 맞춥니다.
     """
-    axis = time_axis % r.dim()
-    r_time_len = r.shape[axis]
-    o_time_len = o.shape[axis]
+    r_time_len = r.shape[-2]
+    o_time_len = o.shape[-2]
     min_time_len = min(r_time_len, o_time_len)
 
     if r_time_len != min_time_len:
-        r = take_last_n_along_axis(r, min_time_len, axis)
+        r = crop_to_last(r, min_time_len)
     if o_time_len != min_time_len:
-        o = take_last_n_along_axis(o, min_time_len, axis)
+        o = crop_to_last(o, min_time_len)
 
     return r, o
 
@@ -119,8 +110,7 @@ def to_flatten(x):
 
 
 def to_pooling(x):
-    # x: [N, ?, ?, D] -> [N, D] (channel/time 두 축(dim=1, dim=2)을 평균내어 축소.
-    # 두 축 모두에 대해 평균 내므로 channel/time의 축 순서와 무관하게 동일하게 동작함)
+    # x: [N, C, T, D] -> [N, D] (channel: dim=1, time: dim=2 에 대해 평균)
     return x.mean(dim=(1, 2))
 
 
