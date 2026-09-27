@@ -42,7 +42,13 @@ EMBED_NUM = 4  # sliced feature에서 사용할, 뒤쪽 time token 개수
 SLICING_MODES = ["raw", "sliced"]     # raw: 원본 feature, sliced: x[..., -EMBED_NUM:, :]
 FEATURE_MODES = ["flatten", "pooling"]  # flatten: 그대로 펼침, pooling: channel/time 축 평균
 
-OUTPUT_CSV = f"{DATASET_PATH}/layer_wise_feature_distance.csv"
+OUTPUT_DIR = DATASET_PATH
+DATE_TAG = "260926"
+
+
+def output_csv_path(slicing_mode, feature_mode):
+    # 예: 260926_layer_wise_feature_distance_raw_flatten.csv
+    return f"{OUTPUT_DIR}/{DATE_TAG}_layer_wise_feature_distance_{slicing_mode}_{feature_mode}.csv"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -248,9 +254,18 @@ def main():
     final_df = pd.concat([df, avg_df], ignore_index=True)
     final_df = final_df[["layer", "split", "method", "slicing_mode", "feature_mode"] + metric_cols]
 
-    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-    final_df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n[완료] 결과 저장: {OUTPUT_CSV}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # slicing_mode/feature_mode 조합별로 별도의 CSV 파일에 저장
+    for slicing_mode in SLICING_MODES:
+        for feature_mode in FEATURE_MODES:
+            combo_df = final_df[
+                (final_df["slicing_mode"] == slicing_mode)
+                & (final_df["feature_mode"] == feature_mode)
+            ]
+            combo_csv = output_csv_path(slicing_mode, feature_mode)
+            combo_df.to_csv(combo_csv, index=False)
+            print(f"[완료] 결과 저장: {combo_csv}")
 
 
 if __name__ == "__main__":
