@@ -59,7 +59,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def load_raw_feature(dataset_path, split_dir, model_folder, layer_num, filename):
     """
     저장된 레이어별 feature(.pt)를 원본 shape 그대로 불러옵니다.
-    반환 shape: [N, channel_token, time_token, embed_dim]
+    반환 shape: [N, time_token, channel_token, embed_dim]
     """
     layer_dir = f"{dataset_path}/{split_dir}/{model_folder}_model/{SUB_TAG}/layer_{layer_num}"
     file_path = os.path.join(layer_dir, filename)
@@ -77,23 +77,23 @@ def load_raw_feature(dataset_path, split_dir, model_folder, layer_num, filename)
 # 2. feature 변환 (slicing / flatten / pooling)
 # ==========================================
 def apply_slicing(x, embed_num):
-    # x: [N, C, T, D] -> [N, C, embed_num, D] (뒤쪽 embed_num개 time token만 사용)
-    return x[..., -embed_num:, :]
+    # x: [N, T, C, D] -> [N, embed_num, C, D] (time_token 축(dim=1)에서 뒤쪽 embed_num개만 사용)
+    return x[:, -embed_num:, :, :]
 
 
 def crop_to_last(x, target_time_len):
-    # x: [N, C, T, D] -> 뒤쪽 target_time_len개 time token만 사용
-    return x[..., -target_time_len:, :]
+    # x: [N, T, C, D] -> time_token 축(dim=1)에서 뒤쪽 target_time_len개만 사용
+    return x[:, -target_time_len:, :, :]
 
 
 def match_time_length(r, o):
     """
     raw + flatten 조합에서만 사용.
     method마다 저장된 time token 수가 다를 수 있으므로(dynamic_pearl의 prompt 등),
-    어느 쪽이 더 길든 상관없이 둘 다 뒤쪽 min(len_r, len_o)개로 잘라 길이를 맞춥니다.
+    어느 쪽이 더 길든 상관없이 둘 다 time_token 축(dim=1) 기준 뒤쪽 min(len_r, len_o)개로 잘라 길이를 맞춥니다.
     """
-    r_time_len = r.shape[-2]
-    o_time_len = o.shape[-2]
+    r_time_len = r.shape[1]
+    o_time_len = o.shape[1]
     min_time_len = min(r_time_len, o_time_len)
 
     if r_time_len != min_time_len:
@@ -105,18 +105,18 @@ def match_time_length(r, o):
 
 
 def to_flatten(x):
-    # x: [N, C, T, D] -> [N, C*T*D]
+    # x: [N, T, C, D] -> [N, T*C*D]
     return x.flatten(start_dim=1)
 
 
 def to_pooling(x):
-    # x: [N, C, T, D] -> [N, D] (channel: dim=1, time: dim=2 에 대해 평균)
+    # x: [N, T, C, D] -> [N, D] (time: dim=1, channel: dim=2 에 대해 평균)
     return x.mean(dim=(1, 2))
 
 
 def build_feature_pair(ref_x, other_x, slicing_mode, feature_mode, embed_num):
     """
-    ref_x, other_x: 원본 raw feature [N, C, T, D] (아직 아무 처리도 하지 않은 상태)
+    ref_x, other_x: 원본 raw feature [N, T, C, D] (아직 아무 처리도 하지 않은 상태)
     slicing_mode: 'raw' 또는 'sliced'
     feature_mode: 'flatten' 또는 'pooling'
     반환: (ref_vec, other_vec) - 각각 [N, D'] 형태의 벡터
