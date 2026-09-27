@@ -119,7 +119,9 @@ def build_feature_pair(ref_x, other_x, slicing_mode, feature_mode, embed_num):
     ref_x, other_x: 원본 raw feature [N, T, C, D] (아직 아무 처리도 하지 않은 상태)
     slicing_mode: 'raw' 또는 'sliced'
     feature_mode: 'flatten' 또는 'pooling'
-    반환: (ref_vec, other_vec) - 각각 [N, D'] 형태의 벡터
+    반환: (ref_vec, other_vec) - 각각 [N, D'] 형태의 벡터.
+    flatten인데 channel 개수 자체가 달라 정렬이 불가능한 경우(예: finetune처럼
+    학습된 chan_conv로 채널 수/의미 자체가 바뀐 method) (None, None)을 반환함.
     """
     r, o = ref_x, other_x
 
@@ -135,6 +137,10 @@ def build_feature_pair(ref_x, other_x, slicing_mode, feature_mode, embed_num):
         # pooling은 time 축을 평균으로 없애버리므로 길이가 달라도 그대로 사용
 
     if feature_mode == "flatten":
+        # channel 축(dim=2) 개수가 다르면 같은 위치의 값이 서로 다른 채널을 의미하게 되어
+        # flatten 비교 자체가 성립하지 않으므로(예: finetune의 학습된 채널 변환) 건너뜀
+        if r.shape[2] != o.shape[2]:
+            return None, None
         r_vec = to_flatten(r)
         o_vec = to_flatten(o)
     elif feature_mode == "pooling":
@@ -211,6 +217,27 @@ def main():
                         r_vec, o_vec = build_feature_pair(
                             ref_x, other_x, slicing_mode, feature_mode, EMBED_NUM
                         )
+
+                        if r_vec is None:
+                            # channel 개수 자체가 달라 flatten 비교가 불가능한 경우
+                            # (예: finetune의 학습된 chan_conv로 채널 수가 바뀐 경우)
+                            print(
+                                f"[스킵] Layer {layer} {split_name} {method_name}"
+                                f"[{slicing_mode}/{feature_mode}]: channel 개수가 달라 "
+                                f"flatten 비교 불가 (reference C={ref_x.shape[2]}, "
+                                f"{method_name} C={other_x.shape[2]})"
+                            )
+                            results.append({
+                                "layer": layer,
+                                "split": split_name,
+                                "method": method_name,
+                                "slicing_mode": slicing_mode,
+                                "feature_mode": feature_mode,
+                                "same_index_pairwise_mean": float("nan"),
+                                "full_pairwise_mean": float("nan"),
+                                "mean_vector_distance": float("nan"),
+                            })
+                            continue
 
                         same_idx_dist = cosine_distance_same_index(r_vec, o_vec)
                         full_pairwise_dist = cosine_distance_full_pairwise(r_vec, o_vec)
