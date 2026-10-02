@@ -124,28 +124,23 @@ def build_feature_vector(x, slicing_mode, feature_mode, embed_num):
 # ==========================================
 # 3. Class separation R^2 (Kornblith et al., 2021, Eq. 11)
 # ==========================================
-def class_separation_r2(x_vec, y, chunk_size=256):
+def class_separation_r2(x_vec, y):
     """
     x_vec: [N, D'] feature 벡터
     y: [N] 클래스 레이블 (0, 1, ..., K-1)
-    반환: (R^2, d_within_bar, d_total_bar)
-
-    float64로 계산한다: feature에 공통 성분이 강하면(transformer hidden state의
-    anisotropy) 모든 cosine similarity가 1에 가까워져 d_total_bar = 1 - ||mu_bar||^2가
-    매우 작아지고, float32에서는 이 뺄셈의 상쇄 오차로 R^2가 틀어진다.
-    raw+flatten은 차원이 커서 전체를 한 번에 float64로 올리지 않고 청크 단위로 누적한다.
     """
+    x_hat = F.normalize(x_vec, dim=1)
     classes = torch.unique(y)
+    K = classes.numel()
 
     mu_list = []
     for c in classes:
-        idx = (y == c).nonzero(as_tuple=True)[0]
-        n_k = idx.numel()
-        s = torch.zeros(x_vec.shape[1], dtype=torch.float64, device=x_vec.device)
-        for start in range(0, n_k, chunk_size):
-            chunk = x_vec.index_select(0, idx[start:start + chunk_size]).double()
-            s += F.normalize(chunk, dim=1).sum(dim=0)
-        mu_list.append(s / n_k)  # (1/N_k) * sum_{m in k} x_m_hat
+        mask = (y == c)
+        n_k = mask.sum().item()
+        if n_k == 0:
+            continue
+        mu_k = x_hat[mask].sum(dim=0) / n_k  # (1/N_k) * sum_{m in k} x_m_hat
+        mu_list.append(mu_k)
 
     mu_stack = torch.stack(mu_list, dim=0)  # [K, D']
 
@@ -155,9 +150,10 @@ def class_separation_r2(x_vec, y, chunk_size=256):
     d_total = 1.0 - mu_bar.pow(2).sum().item()
 
     if d_total == 0.0:
-        return float("nan"), d_within, d_total
+        return float("nan")
 
-    return 1.0 - d_within / d_total, d_within, d_total
+    r2 = 1.0 - d_within / d_total
+    return r2
 
 
 # ==========================================
@@ -181,7 +177,7 @@ def main():
                 for slicing_mode in SLICING_MODES:
                     for feature_mode in FEATURE_MODES:
                         x_vec = build_feature_vector(x, slicing_mode, feature_mode, EMBED_NUM)
-                        r2, d_within, d_total = class_separation_r2(x_vec, y)
+                        r2 = class_separation_r2(x_vec, y)
 
                         results.append({
                             "layer": layer,
@@ -190,23 +186,19 @@ def main():
                             "slicing_mode": slicing_mode,
                             "feature_mode": feature_mode,
                             "class_separation_r2": r2,
-                            "d_within": d_within,
-                            "d_total": d_total,
                         })
 
                         print(
                             f"[Layer {layer}][{split_name}][{method_name}]"
-                            f"[{slicing_mode}/{feature_mode}] R^2={r2:.4f} "
-                            f"(d_within={d_within:.3e}, d_total={d_total:.3e})"
+                            f"[{slicing_mode}/{feature_mode}] R^2={r2:.4f}"
                         )
 
                 del x, y
-                torch.cuda.empty_cache()
 
     df = pd.DataFrame(results)
 
     group_cols = ["layer", "method", "slicing_mode", "feature_mode"]
-    metric_cols = ["class_separation_r2", "d_within", "d_total"]
+    metric_cols = ["class_separation_r2"]
     avg_df = df.groupby(group_cols)[metric_cols].mean().reset_index()
     avg_df["split"] = "average"
 
